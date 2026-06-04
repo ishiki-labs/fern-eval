@@ -35,8 +35,17 @@ What you need (CloudChef-internal deps — your weights/data never touch Fern):
 
 Then:
        export FERN_API_KEY=fern_sk_...
+       # cooked-rice episode (combined_alohastatic_v2_resume world model):
        python examples/cloudchef_scooping_runner.py \
-           --episode-id <uuid> --lerobot-idx 51 --steps 60
+           --episode-id <uuid> --lerobot-idx 51 --steps 60 --rice cooked
+       # uncooked-rice episode (cloudchef_failures_finetune world model):
+       python examples/cloudchef_scooping_runner.py \
+           --episode-id <uuid> --lerobot-idx 1 --steps 60 --rice uncooked
+
+   IMPORTANT: --rice must match the world model the episode was seeded with. The
+   two models were trained with their overhead/front cameras swapped, so the
+   wrong convention sends the cameras to the wrong latent channels and the
+   rollout diverges from frame 0. Defaults to cooked.
 ────────────────────────────────────────────────────────────────────────────
 """
 from __future__ import annotations
@@ -62,9 +71,23 @@ from eval_platform.paths import SCOOPING_POLICY_BUNDLE, SCOOPING_LEROBOT_DIR
 BASE = os.environ.get("FERN_API_BASE", "https://app.fern.bot")
 KEY = os.environ.get("FERN_API_KEY", "")
 VIEWS = ["high", "low", "left_wrist", "right_wrist"]
-# DFoT world-model view name <- LeRobot native video key (used to build step 0)
-INIT_VIEW_SRC = {"high": "front", "low": "overhead",
-                 "left_wrist": "wrist_left", "right_wrist": "wrist_right"}
+# DFoT world-model view name <- LeRobot native video key, used to build the
+# step-0 frame. CloudChef's two scooping world models were trained with
+# DIFFERENT camera->view conventions (see, in the modeling repo,
+# scripts/convert_scooping_4view.py vs scripts/convert_cloudchef_failures.py):
+#
+#   cooked   (combined_alohastatic_v2_resume): front->high,    overhead->low
+#   uncooked (cloudchef_failures_finetune):    overhead->high,  front->low
+#
+# The convention MUST match how the target episode's world model was trained,
+# otherwise the two cameras land in the wrong latent channels and the rollout
+# diverges immediately. Select it with --rice (see main()).
+INIT_VIEW_SRC_BY_RICE = {
+    "cooked": {"high": "front", "low": "overhead",
+               "left_wrist": "wrist_left", "right_wrist": "wrist_right"},
+    "uncooked": {"high": "overhead", "low": "front",
+                 "left_wrist": "wrist_left", "right_wrist": "wrist_right"},
+}
 
 
 def decode_frames(frames: dict[str, str]) -> dict[str, np.ndarray]:
@@ -77,12 +100,13 @@ def decode_frames(frames: dict[str, str]) -> dict[str, np.ndarray]:
     return out
 
 
-def init_views(lerobot_idx: int) -> dict[str, np.ndarray]:
+def init_views(lerobot_idx: int, init_view_src: dict[str, str]) -> dict[str, np.ndarray]:
     """Build the world model's step-0 frame (4 views, 256x256) from the
-    episode's native LeRobot videos — matches scripts/convert_scooping_4view.py."""
+    episode's native LeRobot videos. ``init_view_src`` maps each DFoT view name
+    to the LeRobot native video key for the chosen --rice convention."""
     root = str(SCOOPING_LEROBOT_DIR)
     out = {}
-    for dfot_view, key in INIT_VIEW_SRC.items():
+    for dfot_view, key in init_view_src.items():
         path = f"{root}/videos/observation.images.{key}/chunk-000/file-{lerobot_idx:03d}.mp4"
         container = av.open(path)
         img = None
@@ -119,6 +143,13 @@ def main() -> None:
     ap.add_argument("--execution", default="first_only", choices=["first_only", "halfchunk"],
                     help="policy chunk strategy (see ScoopingPolicy)")
     ap.add_argument("--name", default=None, help="run name shown in the dashboard")
+    ap.add_argument(
+        "--rice", choices=["cooked", "uncooked"], default="cooked",
+        help="camera/view convention, which MUST match the episode's world model: "
+             "'cooked' = combined_alohastatic_v2_resume (front->high, overhead->low); "
+             "'uncooked' = cloudchef_failures_finetune (overhead->high, front->low). "
+             "The uncooked-rice rollouts were trained with the cameras swapped, so "
+             "picking the wrong one makes the world model diverge from step 0.")
     args = ap.parse_args()
 
     if not KEY:
@@ -129,6 +160,26 @@ def main() -> None:
     if deploy_dir:
         sys.path.insert(0, deploy_dir)
     import policy_mode as pm  # noqa: E402
+
+    init_view_src = INIT_VIEW_SRC_BY_RICE[args.rice]
+
+    # The policy consumes the real `overhead` + `wrist_right` cameras. Which WM
+    # view carries the overhead content depends on the rice convention: it's the
+    # `low` view for cooked, but the `high` view for uncooked (cameras swapped at
+    # train time). eval_platform.camera_map hardcodes the cooked mapping, so for
+    # uncooked we override the mapping policy_mode reads (no edit to eval_platform).
+    if args.rice == "uncooked":
+        from eval_platform.camera_map import CameraMapping
+        pm.SCOOPING_POLICY_CAMERAS = (
+            CameraMapping(policy_name="overhead",
+                          lerobot_video_key="observation.images.overhead",
+                          dfot_view_name="high"),
+            CameraMapping(policy_name="wrist_right",
+                          lerobot_video_key="observation.images.wrist_right",
+                          dfot_view_name="right_wrist"),
+        )
+        print("[harness] uncooked convention: policy 'overhead' <- WM 'high', "
+              "step-0 high<-overhead / low<-front")
 
     print("loading CloudChef scooping_v0 policy on", args.device, "...")
     policy = ScoopingPolicy(PolicyConfig(bundle_path=SCOOPING_POLICY_BUNDLE,
@@ -151,7 +202,7 @@ def main() -> None:
     wait_for_init(s, rid)
     print("init done — starting closed loop")
 
-    decoded_views_now = init_views(args.lerobot_idx)
+    decoded_views_now = init_views(args.lerobot_idx, init_view_src)
     max_eff = min(args.steps, n_saved // pm.MODEL_FRAME_SKIP_OVER_SAVED - 1)
     for eff in range(max_eff):
         # 1. Build the policy's inputs (qpos history + now/t-1 cameras) from the

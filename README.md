@@ -89,8 +89,12 @@ worked example in [`examples/cloudchef_scooping_runner.py`](./examples/cloudchef
 # (needs CloudChef-internal deps: eval_platform + policy-runtime bundle + GT data;
 #  see the file's header for setup)
 export FERN_API_KEY=fern_sk_...
+# cooked-rice episode (combined_alohastatic_v2_resume world model):
 python examples/cloudchef_scooping_runner.py \
-    --episode-id <uuid> --lerobot-idx 51 --steps 60
+    --episode-id <uuid> --lerobot-idx 51 --steps 60 --rice cooked
+# uncooked-rice episode (cloudchef_failures_finetune world model):
+python examples/cloudchef_scooping_runner.py \
+    --episode-id <uuid> --lerobot-idx 1 --steps 60 --rice uncooked
 ```
 
 The `prev_action` field on `POST /step` is the key primitive: when set, the
@@ -98,6 +102,15 @@ world model conditions the new token on `[prev_action, action]` and steps one
 token at a time (instead of the default 4‑frame chunk). For eval‑set episodes,
 `GET /api/eval/runs/{id}` returns `gt_actions` (the full saved‑rate ground
 truth) so you can index `[gt_actions[2t-1], gt_actions[2t]]` per token.
+
+**`--rice` (camera convention):** CloudChef's two scooping world models were
+trained with their `overhead`/`front` cameras **swapped** — cooked
+(`combined_alohastatic_v2_resume`) uses `front→high, overhead→low`, while
+uncooked (`cloudchef_failures_finetune`) uses `overhead→high, front→low`. The
+flag sets both the step‑0 view mapping and the policy↔world‑model camera
+mapping accordingly. It **must match the world model the episode was seeded
+with**; the wrong value puts the two cameras in the wrong latent channels and
+the rollout diverges from frame 0. Defaults to `cooked`.
 
 ## 5. The action contract
 
