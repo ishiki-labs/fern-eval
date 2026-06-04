@@ -72,6 +72,33 @@ python eval_client.py --scene cloudchef-scooping --policy-file my_policy.py --st
 
 > Use a different function name with `--policy-fn NAME`.
 
+### Advanced: proprioceptive / bimanual policies
+
+The `policy(obs, step, init_action)` interface above is for **vision‑only**
+policies (cameras in, 16‑D action out). Some policies need more — e.g.
+CloudChef's rice‑scooping policy consumes a **joint (qpos) history**, only
+drives **one arm** (the other is filled from ground truth), and is rolled out
+with training‑aligned **per‑token conditioning** `[a_{2t-1}, a_{2t}]`.
+
+That doesn't fit a stateless callable, so you drive the loop yourself and call
+`POST /api/eval/runs/{id}/step` directly — same API, you just build a richer
+16‑D action each step and pass `prev_action` for faithful conditioning. See the
+worked example in [`examples/cloudchef_scooping_runner.py`](./examples/cloudchef_scooping_runner.py):
+
+```bash
+# (needs CloudChef-internal deps: eval_platform + policy-runtime bundle + GT data;
+#  see the file's header for setup)
+export FERN_API_KEY=fern_sk_...
+python examples/cloudchef_scooping_runner.py \
+    --episode-id <uuid> --lerobot-idx 51 --steps 60
+```
+
+The `prev_action` field on `POST /step` is the key primitive: when set, the
+world model conditions the new token on `[prev_action, action]` and steps one
+token at a time (instead of the default 4‑frame chunk). For eval‑set episodes,
+`GET /api/eval/runs/{id}` returns `gt_actions` (the full saved‑rate ground
+truth) so you can index `[gt_actions[2t-1], gt_actions[2t]]` per token.
+
 ## 5. The action contract
 
 Each action is a **16‑D ALOHA joint‑target vector, normalized to `[-1, 1]`**:
