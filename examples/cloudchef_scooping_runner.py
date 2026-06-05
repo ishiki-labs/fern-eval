@@ -30,22 +30,26 @@ What you need (CloudChef-internal deps — your weights/data never touch Fern):
        export EP_SCOOPING_ACTION_STATS=$EP_SCOOPING_LEROBOT_DIR/action_stats.npz
        export EP_POLICY_RUNTIME_DIR=/path/to/robotics-modeling/policy-runtime
 
-  3. A Fern eval-set episode whose start frame corresponds to `--lerobot-idx`
-     (so the GT proprioception matches the episode the world model starts from).
+Then just point it at a Fern episode id — the harness asks the API which real
+recorded episode that maps to (the LeRobot index + rice/camera convention), so
+you don't have to remember either:
 
-Then:
        export FERN_API_KEY=fern_sk_...
-       # cooked-rice episode (combined_alohastatic_v2_resume world model):
+       python examples/cloudchef_scooping_runner.py --episode-id <uuid> --steps 60
+
+   The LeRobot index it resolves to indexes YOUR local dataset (pointed at by
+   EP_SCOOPING_LEROBOT_DIR), which must be the same dataset the episode was
+   seeded from. Override the lookup if needed:
+
        python examples/cloudchef_scooping_runner.py \
-           --episode-id <uuid> --lerobot-idx 51 --steps 60 --rice cooked
-       # uncooked-rice episode (cloudchef_failures_finetune world model):
-       python examples/cloudchef_scooping_runner.py \
-           --episode-id <uuid> --lerobot-idx 1 --steps 60 --rice uncooked
+           --episode-id <uuid> --lerobot-idx 51 --rice cooked --steps 60
 
    IMPORTANT: --rice must match the world model the episode was seeded with. The
    two models were trained with their overhead/front cameras swapped, so the
    wrong convention sends the cameras to the wrong latent channels and the
-   rollout diverges from frame 0. Defaults to cooked.
+   rollout diverges from frame 0. The API-resolved value already accounts for
+   this; only override it if you know better. Curated episodes (success_NN /
+   failure_NN) carry no LeRobot index, so pass --lerobot-idx for those.
 ────────────────────────────────────────────────────────────────────────────
 """
 from __future__ import annotations
@@ -118,6 +122,19 @@ def init_views(lerobot_idx: int, init_view_src: dict[str, str]) -> dict[str, np.
     return out
 
 
+def fetch_episode_gt(s: requests.Session, episode_id: str) -> dict:
+    """Look up an episode's ground-truth mapping from the API.
+
+    Returns the episode's `gt` descriptor:
+        { "set", "episode", "index", "model", "rice" }
+    where `index` is the LeRobot episode index (or None for non-LeRobot sources)
+    and `rice` is the camera convention implied by the world model. Empty dict if
+    the episode carries no source mapping (e.g. a customer upload)."""
+    r = s.get(f"{BASE}/api/eval/episodes/{episode_id}")
+    r.raise_for_status()
+    return (r.json().get("episode") or {}).get("gt") or {}
+
+
 def wait_for_init(s: requests.Session, rid: str, timeout: float = 240.0) -> None:
     deadline = time.time() + timeout
     while time.time() < deadline:
@@ -134,9 +151,12 @@ def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--episode-id", required=True,
-                    help="Fern eval-set episode whose start frame matches --lerobot-idx")
-    ap.add_argument("--lerobot-idx", type=int, required=True,
-                    help="source LeRobot episode index (provides GT qpos + native videos)")
+                    help="Fern eval-set episode. Its ground-truth source (LeRobot index + "
+                         "rice convention) is looked up from the API, so --lerobot-idx and "
+                         "--rice are optional overrides.")
+    ap.add_argument("--lerobot-idx", type=int, default=None,
+                    help="source LeRobot episode index (provides GT qpos + native videos). "
+                         "Defaults to the index the API maps this episode to.")
     ap.add_argument("--steps", type=int, default=60, help="max effective steps to run")
     ap.add_argument("--n-steps", type=int, default=50, help="diffusion steps per frame")
     ap.add_argument("--device", default="cuda", help="torch device for the policy bundle")
@@ -144,8 +164,9 @@ def main() -> None:
                     help="policy chunk strategy (see ScoopingPolicy)")
     ap.add_argument("--name", default=None, help="run name shown in the dashboard")
     ap.add_argument(
-        "--rice", choices=["cooked", "uncooked"], default="cooked",
-        help="camera/view convention, which MUST match the episode's world model: "
+        "--rice", choices=["cooked", "uncooked"], default=None,
+        help="camera/view convention. Defaults to the convention the API maps this "
+             "episode to (from its world model). Override only if you know better: "
              "'cooked' = combined_alohastatic_v2_resume (front->high, overhead->low); "
              "'uncooked' = cloudchef_failures_finetune (overhead->high, front->low). "
              "The uncooked-rice rollouts were trained with the cameras swapped, so "
@@ -155,20 +176,36 @@ def main() -> None:
     if not KEY:
         raise SystemExit("Set FERN_API_KEY")
 
+    s = requests.Session()
+    s.headers.update({"Authorization": f"Bearer {KEY}"})
+
+    # Look up this episode's ground-truth mapping (which real recorded episode it
+    # came from) so the client only needs --episode-id. CLI flags win if given.
+    gt = fetch_episode_gt(s, args.episode_id)
+    lerobot_idx = args.lerobot_idx if args.lerobot_idx is not None else gt.get("index")
+    rice = args.rice or gt.get("rice") or "cooked"
+    if lerobot_idx is None:
+        raise SystemExit(
+            f"episode {args.episode_id} has no LeRobot GT index "
+            f"(source={gt.get('set')}/{gt.get('episode')}). Pass --lerobot-idx explicitly; "
+            f"only LeRobot-sourced episodes carry a proprioceptive GT index.")
+    print(f"[gt] episode source={gt.get('set')}/{gt.get('episode')} "
+          f"-> lerobot_idx={lerobot_idx} rice={rice} model={gt.get('model')}")
+
     # `policy_mode` lives in the modeling repo's deploy/ dir; allow pointing at it.
     deploy_dir = os.environ.get("EP_DEPLOY_DIR")
     if deploy_dir:
         sys.path.insert(0, deploy_dir)
     import policy_mode as pm  # noqa: E402
 
-    init_view_src = INIT_VIEW_SRC_BY_RICE[args.rice]
+    init_view_src = INIT_VIEW_SRC_BY_RICE[rice]
 
     # The policy consumes the real `overhead` + `wrist_right` cameras. Which WM
     # view carries the overhead content depends on the rice convention: it's the
     # `low` view for cooked, but the `high` view for uncooked (cameras swapped at
     # train time). eval_platform.camera_map hardcodes the cooked mapping, so for
     # uncooked we override the mapping policy_mode reads (no edit to eval_platform).
-    if args.rice == "uncooked":
+    if rice == "uncooked":
         from eval_platform.camera_map import CameraMapping
         pm.SCOOPING_POLICY_CAMERAS = (
             CameraMapping(policy_name="overhead",
@@ -184,12 +221,9 @@ def main() -> None:
     print("loading CloudChef scooping_v0 policy on", args.device, "...")
     policy = ScoopingPolicy(PolicyConfig(bundle_path=SCOOPING_POLICY_BUNDLE,
                                          device=args.device, execution=args.execution))
-    state = pm.build_policy_episode_state(f"sc_{args.lerobot_idx:05d}", policy)
+    state = pm.build_policy_episode_state(f"sc_{lerobot_idx:05d}", policy)
     n_saved = state.wm_actions_saved.shape[0]
     print(f"episode GT loaded: T_native={state.qpos_native.shape[0]} saved_tokens={n_saved}")
-
-    s = requests.Session()
-    s.headers.update({"Authorization": f"Bearer {KEY}"})
 
     r = s.post(f"{BASE}/api/eval/runs", json={
         "episode_id": args.episode_id,
@@ -202,7 +236,7 @@ def main() -> None:
     wait_for_init(s, rid)
     print("init done — starting closed loop")
 
-    decoded_views_now = init_views(args.lerobot_idx, init_view_src)
+    decoded_views_now = init_views(lerobot_idx, init_view_src)
     max_eff = min(args.steps, n_saved // pm.MODEL_FRAME_SKIP_OVER_SAVED - 1)
     for eff in range(max_eff):
         # 1. Build the policy's inputs (qpos history + now/t-1 cameras) from the

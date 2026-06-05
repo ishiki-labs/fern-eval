@@ -89,13 +89,25 @@ worked example in [`examples/cloudchef_scooping_runner.py`](./examples/cloudchef
 # (needs CloudChef-internal deps: eval_platform + policy-runtime bundle + GT data;
 #  see the file's header for setup)
 export FERN_API_KEY=fern_sk_...
-# cooked-rice episode (combined_alohastatic_v2_resume world model):
-python examples/cloudchef_scooping_runner.py \
-    --episode-id <uuid> --lerobot-idx 51 --steps 60 --rice cooked
-# uncooked-rice episode (cloudchef_failures_finetune world model):
-python examples/cloudchef_scooping_runner.py \
-    --episode-id <uuid> --lerobot-idx 1 --steps 60 --rice uncooked
+# Just pass the episode id — the harness looks up its ground-truth source
+# (LeRobot index + rice convention) from the API:
+python examples/cloudchef_scooping_runner.py --episode-id <uuid> --steps 60
 ```
+
+**Episode → ground-truth mapping.** Each eval‑set episode was seeded from a real
+recorded episode, and the API exposes that mapping so the client only needs the
+episode id. `GET /api/eval/episodes/{id}` returns a `gt` block:
+
+```json
+{ "gt": { "set": "scooping-lerobot-v3.0", "episode": "lerobot_051",
+          "index": 51, "model": "combined_alohastatic_v2_resume", "rice": "cooked" } }
+```
+
+The harness reads this to resolve `--lerobot-idx` (`gt.index`) and `--rice`
+(`gt.rice`) automatically; pass either flag to override. `gt.index` indexes
+**your local** LeRobot dataset (`EP_SCOOPING_LEROBOT_DIR`), which must be the
+dataset the episode was seeded from. Curated episodes (`success_NN` /
+`failure_NN`) carry no LeRobot index, so pass `--lerobot-idx` for those.
 
 The `prev_action` field on `POST /step` is the key primitive: when set, the
 world model conditions the new token on `[prev_action, action]` and steps one
@@ -110,7 +122,8 @@ uncooked (`cloudchef_failures_finetune`) uses `overhead→high, front→low`. Th
 flag sets both the step‑0 view mapping and the policy↔world‑model camera
 mapping accordingly. It **must match the world model the episode was seeded
 with**; the wrong value puts the two cameras in the wrong latent channels and
-the rollout diverges from frame 0. Defaults to `cooked`.
+the rollout diverges from frame 0. The API‑resolved `gt.rice` already accounts
+for this — only override if you know better.
 
 ## 5. The action contract
 
