@@ -82,17 +82,24 @@ with training‑aligned **per‑token conditioning** `[a_{2t-1}, a_{2t}]`.
 
 That doesn't fit a stateless callable, so you drive the loop yourself and call
 `POST /api/eval/runs/{id}/step` directly — same API, you just build a richer
-16‑D action each step and pass `prev_action` for faithful conditioning. See the
-worked example in [`examples/cloudchef_scooping_runner.py`](./examples/cloudchef_scooping_runner.py):
+16‑D action each step and pass `prev_action` for faithful conditioning.
+[`examples/cloudchef_scooping_runner.py`](./examples/cloudchef_scooping_runner.py)
+is a worked template for exactly this. It is **fully self‑contained** — no
+internal repo, no native‑video reads — and you plug in just your policy:
 
 ```bash
-# (needs CloudChef-internal deps: eval_platform + policy-runtime bundle + GT data;
-#  see the file's header for setup)
+pip install -r examples/requirements.txt           # requests, numpy, pillow
 export FERN_API_KEY=fern_sk_...
-# Just pass the episode id — the harness looks up its ground-truth source
-# (LeRobot index + rice convention) from the API:
+export FERN_ACTION_STATS=/path/to/action_stats.npz # for right-arm normalization
+# Edit predict_right_arm_7() in the file to call your model, then:
 python examples/cloudchef_scooping_runner.py --episode-id <uuid> --steps 60
 ```
+
+The template creates the run, waits for init, pulls the episode's ground‑truth
+actions (`gt_actions`) from the API for the **un‑driven left arm**, splices in
+your policy's 7‑D right‑arm command (normalized via `action_stats.npz`), and
+steps the world model with training‑aligned `[prev_action, action]`. The only
+external file you supply is `action_stats.npz` (ships next to each dataset).
 
 **Episode → ground-truth mapping.** Each eval‑set episode was seeded from a real
 recorded episode, and the API exposes that mapping so the client only needs the
@@ -103,59 +110,57 @@ episode id. `GET /api/eval/episodes/{id}` returns a `gt` block:
           "index": 51, "model": "combined_alohastatic_v2_resume", "rice": "cooked" } }
 ```
 
-The harness reads this to resolve `--lerobot-idx` (`gt.index`) and `--rice`
-(`gt.rice`) automatically; pass either flag to override. `gt.index` indexes
-**your local** LeRobot dataset (`EP_SCOOPING_LEROBOT_DIR`), which must be the
-dataset the episode was seeded from. Curated episodes (`success_NN` /
-`failure_NN`) carry no LeRobot index, so pass `--lerobot-idx` for those.
+The template reads `gt.rice` (camera convention) from this automatically and
+passes it to your policy; you don't pass an index because the left‑arm GT comes
+straight from `gt_actions` on the run.
 
 The `prev_action` field on `POST /step` is the key primitive: when set, the
 world model conditions the new token on `[prev_action, action]` and steps one
-token at a time (instead of the default 4‑frame chunk). For eval‑set episodes,
-`GET /api/eval/runs/{id}` returns `gt_actions` (the full saved‑rate ground
-truth) so you can index `[gt_actions[2t-1], gt_actions[2t]]` per token.
+token at a time (instead of the default 4‑frame chunk). `GET /api/eval/runs/{id}`
+returns `gt_actions` (the full saved‑rate ground truth, normalized 16‑D) so you
+can index `[gt_actions[2t-1], gt_actions[2t]]` per token. For a **true closed
+loop**, source the right arm of *both* from your policy (the template tracks your
+previous command for `prev_action`; `--prev-source gt` reproduces the oracle
+baseline, which leaks the real trajectory and is not a real eval).
 
-**`--rice` (camera convention):** CloudChef's two scooping world models were
-trained with their `overhead`/`front` cameras **swapped** — cooked
+**rice (camera convention):** CloudChef's two scooping world models were trained
+with their `overhead`/`front` cameras **swapped** — cooked
 (`combined_alohastatic_v2_resume`) uses `front→high, overhead→low`, while
-uncooked (`cloudchef_failures_finetune`) uses `overhead→high, front→low`. The
-flag sets both the step‑0 view mapping and the policy↔world‑model camera
-mapping accordingly. It **must match the world model the episode was seeded
-with**; the wrong value puts the two cameras in the wrong latent channels and
-the rollout diverges from frame 0. The API‑resolved `gt.rice` already accounts
-for this — only override if you know better.
+uncooked (`cloudchef_failures_finetune`) uses `overhead→high, front→low`. Your
+policy must map the world‑model views to its expected cameras using `gt.rice`
+(passed to `predict_right_arm_7(views, step, rice)`), or it sees the wrong
+cameras. The API‑resolved `gt.rice` is authoritative.
 
-### Integrating without the internal repo
+### The action contract, self-contained
 
-The harness above imports `policy_mode`, which lives in the internal
-ishiki‑labs/robotics‑modeling repo. If you're writing your own harness and don't
-have that repo, you don't need it — the only non‑obvious pieces are the action
-**normalization** and the **rate**, which
-[`examples/fern_action_contract.py`](./examples/fern_action_contract.py)
-reproduces with pure numpy (no internal deps):
+The template builds actions via
+[`examples/fern_action_contract.py`](./examples/fern_action_contract.py) —
+pure numpy, no internal deps. Useful if you'd rather write your own loop:
 
-- `load_action_stats(path)` / `lerobot14_to_dfot16(...)` — exact training‑time
-  normalization (needs the dataset's `action_stats.npz`).
-- `build_wm_action_16d(gt_14, right_7, ...)` — merge your policy's 7‑DoF
-  right‑arm output with the GT left arm and normalize → the 16‑D action to POST.
-- `closed_loop_pair(...)` — build `(action, prev_action)` = `[a_{2t}, a_{2t-1}]`
-  with **both sourced from your policy** (true closed loop).
+- `load_action_stats(path)` — load `(amin, amax)` from `action_stats.npz`.
+- `lerobot14_to_dfot16(action_14, ...)` — exact training‑time normalization of a
+  raw 14‑D LeRobot action → normalized 16‑D.
+- `splice_right_arm(gt_action_16, right_7, ...)` — overwrite the right‑arm dims of
+  an already‑normalized GT action (e.g. from `gt_actions`) with your raw 7‑D
+  command. What the template uses each step.
+- `build_wm_action_16d(gt_14, right_7, ...)` / `closed_loop_pair(...)` — same idea
+  from raw 14‑D GT if you have it instead of the API's normalized `gt_actions`.
 - Constants `FRAME_STRIDE=3`, `MODEL_FRAME_SKIP_OVER_SAVED=2`, `EFF_TO_NATIVE=6`.
-
-> **Action layout (important):** the world model was trained on a 14‑D LeRobot
-> action padded to 16‑D — `0..6` left arm (gripper at 6), `7..13` right arm
-> (gripper at 13), `14,15` zero pads — then per‑dim normalized to `[-1, 1]` via
-> `action_stats.npz`. Raw joint values are **not** in `[-1, 1]` until normalized.
 
 ## 5. The action contract
 
-Each action is a **16‑D ALOHA joint‑target vector, normalized to `[-1, 1]`**:
+Each action is a **16‑D vector, normalized to `[-1, 1]`** — a 14‑D LeRobot ALOHA
+action padded to 16‑D, then per‑dim normalized via the dataset's
+`action_stats.npz`:
 
 ```
-indices 0..7   -> left arm  (joints 0..6, gripper at index 7)
-indices 8..15  -> right arm (joints 0..6, gripper at index 15)
+indices 0..6   -> left arm   (6 joints + gripper at index 6)
+indices 7..13  -> right arm  (6 joints + gripper at index 13)
+indices 14,15  -> zero pad
 ```
 
+Normalization uses each dim's `amin`/`amax`, so **raw joint values are not in
+`[-1, 1]` until you normalize** (see `fern_action_contract.lerobot14_to_dfot16`).
 These are **absolute targets, not deltas** — so all‑zeros is **not** "stay
 still" (it commands every joint to its mid‑range pose). To hold the start pose,
 replay the episode's `init_action` (returned by the run/episode reads for

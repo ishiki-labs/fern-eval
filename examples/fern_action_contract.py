@@ -110,6 +110,42 @@ def build_wm_action_16d(
     return lerobot14_to_dfot16(merged, amin, amax)
 
 
+def normalize_right_arm_7(
+    right_7_raw: np.ndarray, amin: np.ndarray, amax: np.ndarray
+) -> np.ndarray:
+    """Normalize a raw 7-D right-arm command to [-1, 1] using the right-arm
+    slice of the training stats. Per-dim, independent of the other dims."""
+    if right_7_raw.shape != (7,):
+        raise ValueError(f"right_7_raw must be (7,), got {right_7_raw.shape}")
+    lo, hi = amin[RIGHT_ARM], amax[RIGHT_ARM]
+    rng = hi - lo
+    safe = np.where(rng < 1e-4, 1.0, rng)
+    offs = np.where(rng < 1e-4, (lo + hi) / 2.0, lo)
+    return np.clip(2.0 * (right_7_raw.astype(np.float32) - offs) / safe - 1.0,
+                   -1.0, 1.0).astype(np.float32)
+
+
+def splice_right_arm(
+    gt_action_16_norm: np.ndarray,
+    right_7_raw: np.ndarray,
+    amin: np.ndarray,
+    amax: np.ndarray,
+) -> np.ndarray:
+    """Overwrite the right-arm dims (7:14) of an ALREADY-normalized 16-D action
+    with your policy's raw 7-D command (normalized in place).
+
+    Use this with the API's `gt_actions` (which are already normalized, saved
+    rate): copy `gt_actions[k]`, splice in your right-arm command, POST it. The
+    left arm + pads stay at their GT-normalized values, so the un-driven arm
+    follows ground truth — exactly what `apply_policy_action_to_dfot16` does,
+    but with zero internal deps."""
+    out = np.asarray(gt_action_16_norm, dtype=np.float32).copy()
+    if out.shape != (ACTION_DIM,):
+        raise ValueError(f"gt_action_16_norm must be (16,), got {out.shape}")
+    out[RIGHT_ARM] = normalize_right_arm_7(np.asarray(right_7_raw, np.float32), amin, amax)
+    return out
+
+
 def closed_loop_pair(
     curr_right_7: np.ndarray,
     prev_right_7: np.ndarray,

@@ -1,65 +1,50 @@
-"""Advanced harness: run a *proprioceptive, bimanual* policy against the Fern
-world model.
+"""Template: run a *proprioceptive, partial-robot* policy against the Fern world
+model — with NO dependency on any internal repo.
 
-The simple `eval_client.py` interface (`policy(obs, step, init_action) -> 16-D`)
-covers vision-only policies. CloudChef's rice-scooping policy is different — it:
+`eval_client.py` covers vision-only policies (`policy(obs, step, init_action) ->
+16-D`). Some policies need more — e.g. CloudChef's rice-scooping policy:
 
-  * consumes a 50-token **right-arm joint (qpos) history** (proprioception),
-  * only outputs the **7-D right arm** (the left arm is filled from ground truth),
+  * consumes a right-arm joint (qpos) **history** (proprioception),
+  * only outputs the **7-D right arm** (the left arm follows ground truth),
   * is best rolled out with training-aligned **per-token conditioning**
     `[a_{2t-1}, a_{2t}]` (sent to the API as `prev_action` + `action`).
 
-None of that fits a stateless `cameras -> action` callable, so we drive the loop
-ourselves and call the **same public API** (`POST /api/eval/runs/{id}/step`)
-directly. This file is the exact harness used to verify CloudChef's policy
-closes the loop on Fern's sim; adapt it for any policy that needs proprioception
-or only drives part of the robot.
+That doesn't fit a stateless `cameras -> action` callable, so you drive the loop
+yourself and call the same public API directly. This template does everything
+except your policy: it creates the run, waits for init, pulls the episode's
+ground-truth actions (`gt_actions`) from the API for the un-driven arm, builds
+the 16-D `[prev, curr]` actions with the correct normalization (via
+`fern_action_contract.py`), and renders the run on the dashboard.
 
-────────────────────────────────────────────────────────────────────────────
-What you need (CloudChef-internal deps — your weights/data never touch Fern):
+You plug in ONE thing — your policy — at `predict_right_arm_7()` below.
 
-  1. The policy bundle + harness code from the modeling repo:
-       git clone --recurse-submodules git@github.com:ishiki-labs/robotics-modeling.git
-       cd robotics-modeling/policy-runtime && git lfs pull        # 474 MB scooping_v0 bundle
-       pip install -e policy-runtime -e eval_platform             # + torch (CUDA)
-     The `policy_mode` module is NOT part of the eval_platform package — it lives
-     at diffusion-forcing-transformer/deploy/policy_mode.py. Put that dir on the
-     import path so `import policy_mode` resolves:
-       export EP_DEPLOY_DIR=/path/to/robotics-modeling/diffusion-forcing-transformer/deploy
+──────────────────────────────────────────────────────────────────────────────
+What you need (all on YOUR side — your weights/data never touch Fern):
 
-     No access to robotics-modeling? You don't need it to talk to the API. The
-     only non-obvious pieces (action normalization + rate) are reproduced with
-     pure numpy in examples/fern_action_contract.py — write your own harness
-     around that and your own policy I/O.
+  1. Your policy. Wrap it in `predict_right_arm_7(views, step, rice)` so it
+     returns the raw 7-D right-arm command (same units as your LeRobot
+     `action[7:14]`). It receives the world model's 4 decoded views (256x256
+     uint8) each step; do your own resize / qpos-history bookkeeping inside.
 
-  2. The episode's ground-truth LeRobot data laid out where eval_platform expects it
-     (qpos parquet + the overhead/wrist_right native videos), and action_stats.npz.
-     Point eval_platform at it with env vars:
-       export EP_SCOOPING_LEROBOT_DIR=/path/to/scooping-lerobot-v3.0
-       export EP_SCOOPING_ACTION_STATS=$EP_SCOOPING_LEROBOT_DIR/action_stats.npz
-       export EP_POLICY_RUNTIME_DIR=/path/to/robotics-modeling/policy-runtime
+  2. `action_stats.npz` for the episode's dataset (ships next to it, e.g.
+     s3://fern-robotics-data/processed/scooping_curated_20/action_stats.npz).
+     Needed only to normalize your right-arm command into the WM's action space.
+       export FERN_ACTION_STATS=/path/to/action_stats.npz
 
-Then just point it at a Fern episode id — the harness asks the API which real
-recorded episode that maps to (the LeRobot index + rice/camera convention), so
-you don't have to remember either:
-
+Then:
        export FERN_API_KEY=fern_sk_...
        python examples/cloudchef_scooping_runner.py --episode-id <uuid> --steps 60
 
-   The LeRobot index it resolves to indexes YOUR local dataset (pointed at by
-   EP_SCOOPING_LEROBOT_DIR), which must be the same dataset the episode was
-   seeded from. Override the lookup if needed:
+The episode's `gt_actions` (used for the left arm) + the `rice`/camera
+convention are fetched from the API automatically; the run is created, stepped,
+and rendered with no manual index/rice bookkeeping.
 
-       python examples/cloudchef_scooping_runner.py \
-           --episode-id <uuid> --lerobot-idx 51 --rice cooked --steps 60
-
-   IMPORTANT: --rice must match the world model the episode was seeded with. The
-   two models were trained with their overhead/front cameras swapped, so the
-   wrong convention sends the cameras to the wrong latent channels and the
-   rollout diverges from frame 0. The API-resolved value already accounts for
-   this; only override it if you know better. Curated episodes (success_NN /
-   failure_NN) carry no LeRobot index, so pass --lerobot-idx for those.
-────────────────────────────────────────────────────────────────────────────
+  IMPORTANT (rice / camera convention): the two scooping world models were
+  trained with their overhead/front cameras swapped, so which WM view carries
+  the overhead vs. front content differs. The API tells you which (`gt.rice`,
+  printed below and passed to your policy); map the WM views to your policy's
+  expected cameras accordingly, or the policy sees the wrong cameras.
+──────────────────────────────────────────────────────────────────────────────
 """
 from __future__ import annotations
 
@@ -67,40 +52,44 @@ import argparse
 import base64
 import io
 import os
-import sys
 import time
 
-import av
-import cv2
 import numpy as np
 import requests
 from PIL import Image
 
-# CloudChef-internal harness (see deps above). These imports require
-# robotics-modeling/{eval_platform,policy-runtime} on PYTHONPATH.
-from eval_platform.policy.wrapper import ScoopingPolicy, PolicyConfig
-from eval_platform.paths import SCOOPING_POLICY_BUNDLE, SCOOPING_LEROBOT_DIR
+# Self-contained action contract (pure numpy; sibling file in this dir).
+from fern_action_contract import (
+    MODEL_FRAME_SKIP_OVER_SAVED,
+    RIGHT_ARM,
+    load_action_stats,
+    splice_right_arm,
+)
 
 BASE = os.environ.get("FERN_API_BASE", "https://app.fern.bot")
 KEY = os.environ.get("FERN_API_KEY", "")
 VIEWS = ["high", "low", "left_wrist", "right_wrist"]
-# DFoT world-model view name <- LeRobot native video key, used to build the
-# step-0 frame. CloudChef's two scooping world models were trained with
-# DIFFERENT camera->view conventions (see, in the modeling repo,
-# scripts/convert_scooping_4view.py vs scripts/convert_cloudchef_failures.py):
-#
-#   cooked   (combined_alohastatic_v2_resume): front->high,    overhead->low
-#   uncooked (cloudchef_failures_finetune):    overhead->high,  front->low
-#
-# The convention MUST match how the target episode's world model was trained,
-# otherwise the two cameras land in the wrong latent channels and the rollout
-# diverges immediately. Select it with --rice (see main()).
-INIT_VIEW_SRC_BY_RICE = {
-    "cooked": {"high": "front", "low": "overhead",
-               "left_wrist": "wrist_left", "right_wrist": "wrist_right"},
-    "uncooked": {"high": "overhead", "low": "front",
-                 "left_wrist": "wrist_left", "right_wrist": "wrist_right"},
-}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TODO: PLUG IN YOUR POLICY.
+# Replace the body with a call into your own model. It must return a raw 7-D
+# right-arm command (np.ndarray shape (7,)), in the same units as your LeRobot
+# `action[7:14]` (this template normalizes it for you). Manage your own qpos
+# history / camera preprocessing inside — keep it across calls with a closure,
+# a class, or module state.
+# ─────────────────────────────────────────────────────────────────────────────
+def predict_right_arm_7(views: dict[str, np.ndarray], step: int, rice: str) -> np.ndarray:
+    """views: {"high","low","left_wrist","right_wrist"} -> (256,256,3) uint8,
+    the world model's latest decoded frame. `rice` ("cooked"/"uncooked") tells
+    you the camera convention (see header). Return your policy's raw 7-D right
+    arm. NOTE: `rice="uncooked"` means the overhead content is in the `high`
+    view (cameras were swapped at train time), `cooked` means it's in `low`."""
+    raise NotImplementedError(
+        "Plug in your policy here: take the world-model views, run your model "
+        "(with your own proprio/qpos state), and return a raw 7-D right-arm "
+        "command. See examples/policy_example.py for the vision-only analogue."
+    )
 
 
 def decode_frames(frames: dict[str, str]) -> dict[str, np.ndarray]:
@@ -113,45 +102,23 @@ def decode_frames(frames: dict[str, str]) -> dict[str, np.ndarray]:
     return out
 
 
-def init_views(lerobot_idx: int, init_view_src: dict[str, str]) -> dict[str, np.ndarray]:
-    """Build the world model's step-0 frame (4 views, 256x256) from the
-    episode's native LeRobot videos. ``init_view_src`` maps each DFoT view name
-    to the LeRobot native video key for the chosen --rice convention."""
-    root = str(SCOOPING_LEROBOT_DIR)
-    out = {}
-    for dfot_view, key in init_view_src.items():
-        path = f"{root}/videos/observation.images.{key}/chunk-000/file-{lerobot_idx:03d}.mp4"
-        container = av.open(path)
-        img = None
-        for frame in container.decode(video=0):
-            img = frame.to_ndarray(format="rgb24")
-            break
-        container.close()
-        out[dfot_view] = cv2.resize(img, (256, 256), interpolation=cv2.INTER_AREA)
-    return out
-
-
 def fetch_episode_gt(s: requests.Session, episode_id: str) -> dict:
-    """Look up an episode's ground-truth mapping from the API.
-
-    Returns the episode's `gt` descriptor:
-        { "set", "episode", "index", "model", "rice" }
-    where `index` is the LeRobot episode index (or None for non-LeRobot sources)
-    and `rice` is the camera convention implied by the world model. Empty dict if
-    the episode carries no source mapping (e.g. a customer upload)."""
+    """Episode's GT mapping: {set, episode, index, model, rice}. Empty if none."""
     r = s.get(f"{BASE}/api/eval/episodes/{episode_id}")
     r.raise_for_status()
     return (r.json().get("episode") or {}).get("gt") or {}
 
 
-def wait_for_init(s: requests.Session, rid: str, timeout: float = 240.0) -> None:
+def wait_for_init(s: requests.Session, rid: str, timeout: float = 240.0) -> dict:
+    """Poll until init lands; returns the full run payload (incl. gt_actions +
+    step-0 frames)."""
     deadline = time.time() + timeout
     while time.time() < deadline:
         d = s.get(f"{BASE}/api/eval/runs/{rid}").json()
         if d["run"].get("status") == "error":
             raise SystemExit("init failed: " + str(d["run"].get("error_msg")))
         if not d.get("initializing") and d.get("frames"):
-            return
+            return d
         time.sleep(2.0)
     raise SystemExit("timed out waiting for world-model init")
 
@@ -159,105 +126,75 @@ def wait_for_init(s: requests.Session, rid: str, timeout: float = 240.0) -> None
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--episode-id", required=True,
-                    help="Fern eval-set episode. Its ground-truth source (LeRobot index + "
-                         "rice convention) is looked up from the API, so --lerobot-idx and "
-                         "--rice are optional overrides.")
-    ap.add_argument("--lerobot-idx", type=int, default=None,
-                    help="source LeRobot episode index (provides GT qpos + native videos). "
-                         "Defaults to the index the API maps this episode to.")
+    ap.add_argument("--episode-id", required=True, help="Fern eval-set episode id")
     ap.add_argument("--steps", type=int, default=60, help="max effective steps to run")
     ap.add_argument("--n-steps", type=int, default=50, help="diffusion steps per frame")
-    ap.add_argument("--device", default="cuda", help="torch device for the policy bundle")
-    ap.add_argument("--execution", default="first_only", choices=["first_only", "halfchunk"],
-                    help="policy chunk strategy (see ScoopingPolicy)")
     ap.add_argument("--name", default=None, help="run name shown in the dashboard")
+    ap.add_argument("--action-stats", default=os.environ.get("FERN_ACTION_STATS"),
+                    help="path to action_stats.npz (or set FERN_ACTION_STATS)")
     ap.add_argument(
-        "--rice", choices=["cooked", "uncooked"], default=None,
-        help="camera/view convention. Defaults to the convention the API maps this "
-             "episode to (from its world model). Override only if you know better: "
-             "'cooked' = combined_alohastatic_v2_resume (front->high, overhead->low); "
-             "'uncooked' = cloudchef_failures_finetune (overhead->high, front->low). "
-             "The uncooked-rice rollouts were trained with the cameras swapped, so "
-             "picking the wrong one makes the world model diverge from step 0.")
+        "--prev-source", choices=["policy", "gt"], default="policy",
+        help="where a_{2t-1} (prev_action) comes from. 'policy' = your previous "
+             "command (true closed loop, default); 'gt' = ground truth (reproduces "
+             "the oracle baseline; leaks the real trajectory, so not a real eval).")
     args = ap.parse_args()
 
     if not KEY:
         raise SystemExit("Set FERN_API_KEY")
+    if not args.action_stats:
+        raise SystemExit("Set --action-stats / FERN_ACTION_STATS (action_stats.npz)")
+    amin, amax = load_action_stats(args.action_stats)
 
     s = requests.Session()
     s.headers.update({"Authorization": f"Bearer {KEY}"})
 
-    # Look up this episode's ground-truth mapping (which real recorded episode it
-    # came from) so the client only needs --episode-id. CLI flags win if given.
     gt = fetch_episode_gt(s, args.episode_id)
-    lerobot_idx = args.lerobot_idx if args.lerobot_idx is not None else gt.get("index")
-    rice = args.rice or gt.get("rice") or "cooked"
-    if lerobot_idx is None:
-        raise SystemExit(
-            f"episode {args.episode_id} has no LeRobot GT index "
-            f"(source={gt.get('set')}/{gt.get('episode')}). Pass --lerobot-idx explicitly; "
-            f"only LeRobot-sourced episodes carry a proprioceptive GT index.")
+    rice = gt.get("rice") or "cooked"
     print(f"[gt] episode source={gt.get('set')}/{gt.get('episode')} "
-          f"-> lerobot_idx={lerobot_idx} rice={rice} model={gt.get('model')}")
-
-    # `policy_mode` lives in the modeling repo's deploy/ dir; allow pointing at it.
-    deploy_dir = os.environ.get("EP_DEPLOY_DIR")
-    if deploy_dir:
-        sys.path.insert(0, deploy_dir)
-    import policy_mode as pm  # noqa: E402
-
-    init_view_src = INIT_VIEW_SRC_BY_RICE[rice]
-
-    # The policy consumes the real `overhead` + `wrist_right` cameras. Which WM
-    # view carries the overhead content depends on the rice convention: it's the
-    # `low` view for cooked, but the `high` view for uncooked (cameras swapped at
-    # train time). eval_platform.camera_map hardcodes the cooked mapping, so for
-    # uncooked we override the mapping policy_mode reads (no edit to eval_platform).
-    if rice == "uncooked":
-        from eval_platform.camera_map import CameraMapping
-        pm.SCOOPING_POLICY_CAMERAS = (
-            CameraMapping(policy_name="overhead",
-                          lerobot_video_key="observation.images.overhead",
-                          dfot_view_name="high"),
-            CameraMapping(policy_name="wrist_right",
-                          lerobot_video_key="observation.images.wrist_right",
-                          dfot_view_name="right_wrist"),
-        )
-        print("[harness] uncooked convention: policy 'overhead' <- WM 'high', "
-              "step-0 high<-overhead / low<-front")
-
-    print("loading CloudChef scooping_v0 policy on", args.device, "...")
-    policy = ScoopingPolicy(PolicyConfig(bundle_path=SCOOPING_POLICY_BUNDLE,
-                                         device=args.device, execution=args.execution))
-    state = pm.build_policy_episode_state(f"sc_{lerobot_idx:05d}", policy)
-    n_saved = state.wm_actions_saved.shape[0]
-    print(f"episode GT loaded: T_native={state.qpos_native.shape[0]} saved_tokens={n_saved}")
+          f"rice={rice} model={gt.get('model')}")
 
     r = s.post(f"{BASE}/api/eval/runs", json={
         "episode_id": args.episode_id,
         "name": args.name or f"cloudchef policy {time.strftime('%H:%M:%S')}",
-        "policy_name": "cloudchef scooping_v0 (learned)",
+        "policy_name": "cloudchef scooping (learned)",
     })
     r.raise_for_status()
     rid = r.json()["run"]["id"]
     print(f"run {rid} — waiting for world-model init (cold start ~60s)...")
-    wait_for_init(s, rid)
-    print("init done — starting closed loop")
+    run = wait_for_init(s, rid)
 
-    decoded_views_now = init_views(lerobot_idx, init_view_src)
-    max_eff = min(args.steps, n_saved // pm.MODEL_FRAME_SKIP_OVER_SAVED - 1)
+    # gt_actions: full saved-rate normalized 16-D GT sequence. token t is
+    # conditioned on [gt[2t-1], gt[2t]]; we keep the left arm from GT and splice
+    # in the policy's right arm. Required for this proprioceptive (bimanual) path.
+    gt_actions = run.get("gt_actions")
+    if not gt_actions:
+        raise SystemExit(
+            "episode has no gt_actions (needed for the un-driven left arm). Use a "
+            "LeRobot-sourced eval episode, or drive both arms yourself.")
+    gt_actions = [np.asarray(a, dtype=np.float32) for a in gt_actions]
+    n_saved = len(gt_actions)
+    print(f"init done — gt saved-rate actions={n_saved}; starting closed loop")
+
+    # Seed prev right-arm (normalized) from GT's first intermediate sub-step.
+    prev_right_norm = gt_actions[min(1, n_saved - 1)][RIGHT_ARM].copy()
+    views = decode_frames(run["frames"][0]["frames"])  # step-0 (the start frame)
+    max_eff = min(args.steps, n_saved // MODEL_FRAME_SKIP_OVER_SAVED - 1)
     for eff in range(max_eff):
-        # 1. Build the policy's inputs (qpos history + now/t-1 cameras) from the
-        #    latest world-model frame, then run the policy -> 7-D right arm.
-        qpos_stack, current_qpos, cam_inputs = pm.policy_step_inputs(
-            state, policy, decoded_views_now, eff)
-        a7 = policy.predict_action(qpos_stack=qpos_stack, current_qpos=current_qpos,
-                                   camera_frames_uint8=cam_inputs, frame_index=eff)
-        # 2. Merge with GT left arm + normalize -> the 16-D action for the next token.
-        curr16 = pm.apply_policy_action_to_dfot16(state, a7, eff)
-        prev16 = state.wm_actions_saved[
-            min(pm.MODEL_FRAME_SKIP_OVER_SAVED * (eff + 1) - 1, n_saved - 1)]
+        t = eff + 1
+        i_curr = min(MODEL_FRAME_SKIP_OVER_SAVED * t, n_saved - 1)      # 2t
+        i_prev = min(MODEL_FRAME_SKIP_OVER_SAVED * t - 1, n_saved - 1)  # 2t-1
+
+        # 1. Your policy -> raw 7-D right arm from the current WM frame.
+        right7 = np.asarray(predict_right_arm_7(views, eff, rice), dtype=np.float32)
+
+        # 2. Splice into the GT-normalized actions (left arm stays GT).
+        curr16 = splice_right_arm(gt_actions[i_curr], right7, amin, amax)
+        if args.prev_source == "policy":
+            prev16 = gt_actions[i_prev].copy()
+            prev16[RIGHT_ARM] = prev_right_norm   # your previous command -> closed loop
+        else:
+            prev16 = gt_actions[i_prev]           # GT (oracle baseline; leaks trajectory)
+
         # 3. Step the world model with training-aligned [prev_action, action].
         t0 = time.time()
         rr = s.post(f"{BASE}/api/eval/runs/{rid}/step", json={
@@ -267,7 +204,8 @@ def main() -> None:
         })
         rr.raise_for_status()
         res = rr.json()
-        decoded_views_now = decode_frames(res["frames"])
+        views = decode_frames(res["frames"])
+        prev_right_norm = curr16[RIGHT_ARM].copy()
         print(f"  eff {eff:3d} -> step {res['step']:3d}  ({time.time() - t0:.2f}s)")
 
     s.delete(f"{BASE}/api/eval/runs/{rid}")

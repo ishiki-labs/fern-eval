@@ -1,11 +1,7 @@
-# Extra deps for examples/cloudchef_scooping_runner.py (proprioceptive harness).
-# The base CLI (../requirements.txt) does NOT need these.
-#
-# Also required (CloudChef-internal, install from the modeling repo):
-#   pip install -e robotics-modeling/policy-runtime -e robotics-modeling/eval_platform
-#   torch (CUDA build for your GPU)  +  the scooping_v0 LFS bundle
+# Deps for examples/cloudchef_scooping_runner.py (proprioceptive harness template)
+# and examples/fern_action_contract.py (action contract). Both are self-contained
+# and need NO internal repo — just these. You bring your own policy + its deps
+# (e.g. torch) separately.
 requests>=2.31
 numpy>=1.24
 pillow>=10.0
-av>=11.0
-opencv-python-headless>=4.8
