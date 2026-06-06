@@ -106,11 +106,16 @@ recorded episode, and the API exposes that mapping so the client only needs the
 episode id. `GET /api/eval/episodes/{id}` returns a `gt` block:
 
 ```json
-{ "gt": { "set": "scooping-lerobot-v3.0", "episode": "lerobot_051",
-          "index": 51, "model": "combined_alohastatic_v2_resume", "rice": "cooked" } }
+{ "gt": { "set": "scooping-lerobot-v3.0", "episode": "lerobot_051", "index": 51,
+          "recording_id": "dual_arm_recording_20260312_115500_subtask_1773341713755362991",
+          "model": "combined_alohastatic_v2_resume", "rice": "cooked" } }
 ```
 
-The template reads `gt.rice` (camera convention) from this automatically and
+`gt.recording_id` is the original recording id at that index — the `episode_id`
+column of the dataset's `meta/custom_metadata.csv` — so you can line a Fern
+episode up with the exact recording in your own data. It's `null` when the
+episode has no single source recording (e.g. curated episodes with no LeRobot
+index). The template reads `gt.rice` (camera convention) automatically and
 passes it to your policy; you don't pass an index because the left‑arm GT comes
 straight from `gt_actions` on the run.
 
