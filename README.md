@@ -125,6 +125,28 @@ with**; the wrong value puts the two cameras in the wrong latent channels and
 the rollout diverges from frame 0. The API‑resolved `gt.rice` already accounts
 for this — only override if you know better.
 
+### Integrating without the internal repo
+
+The harness above imports `policy_mode`, which lives in the internal
+ishiki‑labs/robotics‑modeling repo. If you're writing your own harness and don't
+have that repo, you don't need it — the only non‑obvious pieces are the action
+**normalization** and the **rate**, which
+[`examples/fern_action_contract.py`](./examples/fern_action_contract.py)
+reproduces with pure numpy (no internal deps):
+
+- `load_action_stats(path)` / `lerobot14_to_dfot16(...)` — exact training‑time
+  normalization (needs the dataset's `action_stats.npz`).
+- `build_wm_action_16d(gt_14, right_7, ...)` — merge your policy's 7‑DoF
+  right‑arm output with the GT left arm and normalize → the 16‑D action to POST.
+- `closed_loop_pair(...)` — build `(action, prev_action)` = `[a_{2t}, a_{2t-1}]`
+  with **both sourced from your policy** (true closed loop).
+- Constants `FRAME_STRIDE=3`, `MODEL_FRAME_SKIP_OVER_SAVED=2`, `EFF_TO_NATIVE=6`.
+
+> **Action layout (important):** the world model was trained on a 14‑D LeRobot
+> action padded to 16‑D — `0..6` left arm (gripper at 6), `7..13` right arm
+> (gripper at 13), `14,15` zero pads — then per‑dim normalized to `[-1, 1]` via
+> `action_stats.npz`. Raw joint values are **not** in `[-1, 1]` until normalized.
+
 ## 5. The action contract
 
 Each action is a **16‑D ALOHA joint‑target vector, normalized to `[-1, 1]`**:

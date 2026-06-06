@@ -27,6 +27,11 @@ What you need (CloudChef-internal deps — your weights/data never touch Fern):
      import path so `import policy_mode` resolves:
        export EP_DEPLOY_DIR=/path/to/robotics-modeling/diffusion-forcing-transformer/deploy
 
+     No access to robotics-modeling? You don't need it to talk to the API. The
+     only non-obvious pieces (action normalization + rate) are reproduced with
+     pure numpy in examples/fern_action_contract.py — write your own harness
+     around that and your own policy I/O.
+
   2. The episode's ground-truth LeRobot data laid out where eval_platform expects it
      (qpos parquet + the overhead/wrist_right native videos), and action_stats.npz.
      Point eval_platform at it with env vars:
