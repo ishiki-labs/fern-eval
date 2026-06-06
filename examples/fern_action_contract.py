@@ -1,10 +1,9 @@
-"""Self-contained Fern world-model action contract — no robotics-modeling needed.
+"""Self-contained Fern world-model action contract — pure numpy, no deps.
 
-The reference harness (`cloudchef_scooping_runner.py`) imports `policy_mode`,
-which lives in the **internal** ishiki-labs/robotics-modeling repo. If you don't
-have that repo, this module reproduces the only parts you actually need to talk
-to the Fern `/step` API from your own harness: the exact action **normalization**
-and the **rate** constants. Pure numpy, no torch, no internal deps.
+This module reproduces the only non-obvious parts you need to talk to the Fern
+`/step` API: the exact action **normalization** and the **rate** constants. The
+reference harness (`cloudchef_scooping_runner.py`) uses it; you can too if you
+write your own loop. Pure numpy, no torch, no internal repos.
 
 You still bring your own policy, its camera preprocessing, and your GT data; this
 just guarantees the 16-D action you POST matches what the world model was trained
