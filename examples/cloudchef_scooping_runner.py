@@ -22,6 +22,10 @@ What you need (CloudChef-internal deps — your weights/data never touch Fern):
        git clone --recurse-submodules git@github.com:ishiki-labs/robotics-modeling.git
        cd robotics-modeling/policy-runtime && git lfs pull        # 474 MB scooping_v0 bundle
        pip install -e policy-runtime -e eval_platform             # + torch (CUDA)
+     The `policy_mode` module is NOT part of the eval_platform package — it lives
+     at diffusion-forcing-transformer/deploy/policy_mode.py. Put that dir on the
+     import path so `import policy_mode` resolves:
+       export EP_DEPLOY_DIR=/path/to/robotics-modeling/diffusion-forcing-transformer/deploy
 
   2. The episode's ground-truth LeRobot data laid out where eval_platform expects it
      (qpos parquet + the overhead/wrist_right native videos), and action_stats.npz.
