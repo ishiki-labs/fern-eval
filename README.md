@@ -113,11 +113,11 @@ episode id. `GET /api/eval/episodes/{id}` returns a `gt` block:
 
 `gt.recording_id` is the original recording id at that index — the `episode_id`
 column of the dataset's `meta/custom_metadata.csv` — so you can line a Fern
-episode up with the exact recording in your own data. It's `null` when the
-episode has no single source recording (e.g. curated episodes with no LeRobot
-index). The template reads `gt.rice` (camera convention) automatically and
-passes it to your policy; you don't pass an index because the left‑arm GT comes
-straight from `gt_actions` on the run.
+episode up with the exact recording in your own data. Every eval‑set episode
+carries `set` + `index` + `recording_id`; they're `null` only for episodes with
+no source recording (e.g. customer uploads). The template reads `gt.rice`
+(camera convention) automatically and passes it to your policy; you don't pass
+an index because the left‑arm GT comes straight from `gt_actions` on the run.
 
 The `prev_action` field on `POST /step` is the key primitive: when set, the
 world model conditions the new token on `[prev_action, action]` and steps one
