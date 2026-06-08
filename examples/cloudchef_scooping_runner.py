@@ -102,11 +102,11 @@ def decode_frames(frames: dict[str, str]) -> dict[str, np.ndarray]:
     return out
 
 
-def fetch_episode_gt(s: requests.Session, episode_id: str) -> dict:
-    """Episode's GT mapping: {set, episode, index, model, rice}. Empty if none."""
+def fetch_episode(s: requests.Session, episode_id: str) -> dict:
+    """Full episode payload: {gt, action_stats, rate, init_action, ...}."""
     r = s.get(f"{BASE}/api/eval/episodes/{episode_id}")
     r.raise_for_status()
-    return (r.json().get("episode") or {}).get("gt") or {}
+    return r.json().get("episode") or {}
 
 
 def wait_for_init(s: requests.Session, rid: str, timeout: float = 240.0) -> dict:
@@ -131,7 +131,8 @@ def main() -> None:
     ap.add_argument("--n-steps", type=int, default=50, help="diffusion steps per frame")
     ap.add_argument("--name", default=None, help="run name shown in the dashboard")
     ap.add_argument("--action-stats", default=os.environ.get("FERN_ACTION_STATS"),
-                    help="path to action_stats.npz (or set FERN_ACTION_STATS)")
+                    help="path to action_stats.npz. Optional — the API now serves "
+                         "the stats (episode.action_stats); pass this only to override.")
     ap.add_argument(
         "--prev-source", choices=["policy", "gt"], default="policy",
         help="where a_{2t-1} (prev_action) comes from. 'policy' = your previous "
@@ -141,16 +142,23 @@ def main() -> None:
 
     if not KEY:
         raise SystemExit("Set FERN_API_KEY")
-    if not args.action_stats:
-        raise SystemExit("Set --action-stats / FERN_ACTION_STATS (action_stats.npz)")
-    amin, amax = load_action_stats(args.action_stats)
 
     s = requests.Session()
     s.headers.update({"Authorization": f"Bearer {KEY}"})
 
-    gt = fetch_episode_gt(s, args.episode_id)
+    ep = fetch_episode(s, args.episode_id)
+    gt = ep.get("gt") or {}
     rice = gt.get("rice") or "cooked"
+    # action_stats: prefer the API (no local file needed); --action-stats overrides.
+    if args.action_stats:
+        amin, amax = load_action_stats(args.action_stats)
+    elif ep.get("action_stats"):
+        amin = np.asarray(ep["action_stats"]["amin"], np.float32)
+        amax = np.asarray(ep["action_stats"]["amax"], np.float32)
+    else:
+        raise SystemExit("no action_stats from API; pass --action-stats action_stats.npz")
     print(f"[gt] episode source={gt.get('set')}/{gt.get('episode')} "
+          f"idx={gt.get('index')} recording={gt.get('recording_id')} "
           f"rice={rice} model={gt.get('model')}")
 
     r = s.post(f"{BASE}/api/eval/runs", json={

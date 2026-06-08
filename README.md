@@ -90,16 +90,17 @@ internal repo, no native‑video reads — and you plug in just your policy:
 ```bash
 pip install -r examples/requirements.txt           # requests, numpy, pillow
 export FERN_API_KEY=fern_sk_...
-export FERN_ACTION_STATS=/path/to/action_stats.npz # for right-arm normalization
 # Edit predict_right_arm_7() in the file to call your model, then:
 python examples/cloudchef_scooping_runner.py --episode-id <uuid> --steps 60
 ```
 
 The template creates the run, waits for init, pulls the episode's ground‑truth
 actions (`gt_actions`) from the API for the **un‑driven left arm**, splices in
-your policy's 7‑D right‑arm command (normalized via `action_stats.npz`), and
-steps the world model with training‑aligned `[prev_action, action]`. The only
-external file you supply is `action_stats.npz` (ships next to each dataset).
+your policy's 7‑D right‑arm command (normalized via the API‑served
+`action_stats`), and steps the world model with training‑aligned
+`[prev_action, action]`. **No local files needed** — the normalization stats
+come from the API (`episode.action_stats`, `amin`/`amax`, 16‑D); pass
+`--action-stats action_stats.npz` only to override.
 
 **Episode → ground-truth mapping.** Each eval‑set episode was seeded from a real
 recorded episode, and the API exposes that mapping so the client only needs the
